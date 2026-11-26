@@ -1,0 +1,274 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="theme-color" content="#16131F">
+<meta name="robots" content="noindex">
+<title>Household Names</title>
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="style.css">
+</head>
+<body class="phone">
+<div id="offline" class="offline hide">Reconnecting…</div>
+<div id="app" class="app"></div>
+<script src="rules.js"></script>
+<script src="common.js"></script>
+<script>
+(function () {
+  'use strict';
+  var G = window.Game, R = window.Rules, $ = G.$, esc = G.esc;
+  var app = $('#app');
+  var seat = G.store.get('hn.seat', null);
+  var urlCode = (new URLSearchParams(location.search).get('code') || '').toUpperCase().replace(/[^A-Z]/g, '').slice(0, 4);
+  if (seat && urlCode && seat.code !== urlCode) seat = null;          // scanned a different game's code
+  var S = null, joinErr = '', waiting = !!seat, rejoinTries = 0, lastKey = '', lastCard = null, lowBuzzed = false;
+
+  var conn = G.connect({
+    hello: function () { return seat ? { t: 'rejoin', code: seat.code, id: seat.id, token: seat.token } : null; },
+    onStatus: function (up) { $('#offline').classList.toggle('hide', up); },
+    onMessage: onMessage
+  });
+  G.stayAwake();
+
+  function onMessage(m) {
+    if (m.t === 'seated') {
+      seat = { code: m.code, id: m.id, token: m.token, name: m.name };
+      G.store.set('hn.seat', seat); G.store.set('hn.name', m.name);
+      waiting = false; rejoinTries = 0; joinErr = '';
+      return;
+    }
+    if (m.t === 'state') { S = m; G.sync(m); return draw(); }
+    if (m.t === 'nope') {
+      if (m.why === 'noroom' && seat && rejoinTries < 25) {            // the server may have just restarted: the TV hands the game back
+        rejoinTries++; waiting = true; draw();
+        return setTimeout(function () { if (seat) conn.send({ t: 'rejoin', code: seat.code, id: seat.id, token: seat.token }); }, 2000);
+      }
+      if (m.why === 'noroom' || m.why === 'noseat') { if (seat) { urlCode = urlCode || seat.code; } seat = null; S = null; waiting = false; G.store.del('hn.seat'); }
+      joinErr = m.msg || '';
+      if (S && m.msg) return G.toast(m.msg);
+      return draw();
+    }
+    if (m.t === 'left' || m.t === 'bumped') {
+      seat = null; S = null; waiting = false; G.store.del('hn.seat');
+      joinErr = m.t === 'bumped' ? 'This seat was opened on another phone.' : '';
+      return draw();
+    }
+    if (m.t === 'fx') return fx(m);
+  }
+  function fx(m) {
+    if (!S || !S.you) return;
+    var mine = S.turn && S.turn.giver === S.you.id;
+    if (m.k === 'got' && mine) G.buzz(40);
+    if (m.k === 'time') G.buzz(mine ? [200, 80, 200] : 120);
+    if (m.k === 'only') G.toast('That is the last card. No skipping it!');
+    if (m.k === 'ended') G.toast('The host ended the game.');
+  }
+  function act(m) { if (!conn.send(m)) G.toast('Not connected. One moment…'); }
+
+  /* ------------------------------------------------------------ screens */
+
+  function draw() {
+    var html, key;
+    if (!S || !seat) { key = waiting ? 'wait' : 'join'; html = waiting ? waitView() : joinView(); }
+    else {
+      var me = S.you, t = S.turn, giver = t && t.giver === me.id;
+      key = S.phase + '|' + (t ? t.giver : '') + '|' + (S.card ? S.card.id : '') + '|' + (t && t.paused);
+      html = top() + ({ lobby: lobbyView, intro: introView, ready: readyView, turn: giver ? giveView : watchView, recap: recapView, roundEnd: roundEndView, over: overView }[S.phase] || lobbyView)(me, t, giver);
+    }
+    // Keep what is being typed when the lobby redraws under someone's fingers.
+    var active = document.activeElement, keep = active && active.id && app.contains(active) ? { id: active.id, v: active.value } : null;
+    var other = {}; app.querySelectorAll('input[id]').forEach(function (i) { other[i.id] = i.value; });
+    app.innerHTML = html;
+    app.querySelectorAll('input[id]').forEach(function (i) { if (other[i.id] != null) i.value = other[i.id]; });
+    if (keep) { var el = document.getElementById(keep.id); if (el) { el.focus(); try { el.setSelectionRange(keep.v.length, keep.v.length); } catch (e) { /* not a text field */ } } }
+    var c = $('.play .card');
+    if (c && S && S.card && lastCard !== S.card.id) { c.classList.add('fresh'); }
+    lastCard = S && S.card ? S.card.id : null;
+    if (key !== lastKey) { window.scrollTo(0, 0); lowBuzzed = false; }
+    lastKey = key;
+    tick();
+  }
+
+  function top() {
+    return '<div class="bar">' + G.logo() + '<div class="bar-right"><span class="code-tag">' + esc(S.code) + '</span>' +
+      '<button class="icon-btn" data-act="help" aria-label="How to play">?</button>' +
+      '<button class="icon-btn" data-act="menu" aria-label="Menu">≡</button></div></div>';
+  }
+  function waitView() {
+    return '<div class="grow center">' + G.logo() + '<p class="sub">Getting your seat back…</p>' +
+      '<button class="btn ghost small" data-act="forget" style="align-self:center">Join a different game</button></div>';
+  }
+  function joinView() {
+    return '<div class="join-hero">' + G.logo() + '<p>A guessing game for the whole room.<br>Put the game on a TV, then join here.</p></div>' +
+      '<form class="panel stack" id="joinForm" autocomplete="off">' +
+      '<label class="field">Game code<input class="code" id="code" inputmode="text" maxlength="4" autocapitalize="characters" placeholder="ABCD" value="' + esc(urlCode) + '"></label>' +
+      '<label class="field">Your name<input id="name" maxlength="14" autocapitalize="words" placeholder="Name" value="' + esc(G.store.get('hn.name', '')) + '"></label>' +
+      '<div class="err">' + esc(joinErr) + '</div>' +
+      '<button class="btn primary wide" type="submit">Join the game</button></form>' +
+      '<p class="sub center" style="font-size:.85em">Version ' + G.VERSION + '</p>';
+  }
+  function teamBlock(t, me, pickable) {
+    var mine = t.id === me.team;
+    var names = t.players.map(function (p) {
+      return '<span class="name' + (p.id === me.id ? ' me' : '') + (p.on ? '' : ' off') + (p.id === S.captainId ? ' cap' : '') + '">' + esc(p.name) + '</span>';
+    }).join('') || '<span class="empty">Nobody yet</span>';
+    return '<' + (pickable ? 'button' : 'div') + ' class="team-pick' + (mine ? ' mine' : '') + '" style="' + G.teamStyle(t.id) + '"' + (pickable ? ' data-act="team" data-team="' + t.id + '"' : '') + '>' +
+      '<div class="team-head"><span class="team-name">' + esc(t.name) + '</span><span class="team-you">' + (mine ? 'Your team' : pickable ? 'Tap to switch' : '') + '</span></div>' +
+      '<div class="names">' + names + '</div></' + (pickable ? 'button' : 'div') + '>';
+  }
+  function settingBtn(key, full) {
+    var v = S.settings[key], titles = { rating: 'Deck', cards: 'Deck size', timer: 'Turn clock', rounds: 'Rounds', teams: 'Teams' };
+    return '<button class="setting' + (full ? ' full' : '') + (key === 'rating' && v === 'dark' ? ' dark' : '') + '" data-act="set" data-key="' + key + '"><b>' + titles[key] + '</b><span>' + esc(R.label(key, v)) + '</span></button>';
+  }
+  function lobbyView(me) {
+    var h = '<div class="stack">' + S.teams.map(function (t) { return teamBlock(t, me, true); }).join('') + '</div>' +
+      '<div class="host-row"><button class="btn ghost small" data-act="rename">Rename my team</button></div>';
+    if (me.captain) {
+      h += '<div class="panel stack"><div class="eyebrow">You are the host ★</div><div class="settings">' +
+        settingBtn('rating', true) + settingBtn('teams') + settingBtn('cards') + settingBtn('timer') + settingBtn('rounds') + '</div>' +
+        '<button class="btn ghost small" data-act="shuffle">Shuffle the teams</button>' +
+        '<div class="err">' + esc(S.startError) + '</div>' +
+        '<button class="btn primary wide" data-act="start"' + (S.startError ? ' disabled' : '') + '>Start the game</button></div>';
+    } else {
+      h += '<div class="panel center"><div class="eyebrow">' + esc(R.label('rating', S.settings.rating)) + ' · ' + S.settings.cards + ' cards · ' + S.settings.timer + 's</div>' +
+        '<p class="sub">Pick a team. The host starts the game when everyone is in.</p></div>';
+    }
+    return h;
+  }
+  function ruleStrip() { var r = R.ROUNDS[S.round - 1]; return '<div class="rule-strip"><b>Round ' + S.round + '</b>' + esc(r.name) + ': ' + esc(r.short) + '</div>'; }
+  function hostRow(btns) { return S.you.captain ? '<div class="host-row">' + btns + '</div>' : ''; }
+  function introView() {
+    return '<div class="grow">' + G.roundCard(S.round, S.rounds) + '</div>' + hostRow('<button class="btn small" data-act="next">Skip ahead</button>');
+  }
+  function readyView(me, t, giver) {
+    var team = S.teams.filter(function (x) { return x.id === t.team; })[0], onTeam = me.team === t.team;
+    if (giver) {
+      return '<div class="grow center"><div class="eyebrow">You are up</div><div class="big">Your team guesses.<br>You give the clues.</div>' + ruleStrip() +
+        '<p class="sub">Tap <b>Got it</b> when they say the name. Tap <b>Skip</b> if you are stuck or you break a rule.</p></div>' +
+        '<button class="btn go wide" style="min-height:4.6em;font-size:1.25em" data-act="go">Start my ' + S.timerSec + ' seconds</button>';
+    }
+    return '<div class="grow center"><span class="team-tag" style="' + G.teamStyle(t.team) + ';align-self:center">' + esc(team ? team.name : '') + '</span>' +
+      '<div class="big">' + esc(t.giverName) + ' is up next</div>' + ruleStrip() +
+      '<p class="sub">' + (onTeam ? 'Get ready to shout out your guesses.' : 'Sit back and keep them honest.') + '</p></div>' +
+      hostRow('<button class="btn small" data-act="pass">' + esc(t.giverName) + ' stepped away: pass the turn</button>');
+  }
+  function clock(t) {
+    return '<div class="clock" id="clock"><span class="clock-num" id="clockNum"></span><div class="clock-bar"><i id="clockBar"></i></div>' +
+      '<button class="icon-btn" data-act="' + (t.paused ? 'resume' : 'pause') + '" aria-label="' + (t.paused ? 'Resume' : 'Pause') + '">' + (t.paused ? '▶' : 'Ⅱ') + '</button></div>';
+  }
+  function giveView(me, t) {
+    var pts = G.points(t.won);
+    var mid = t.paused ? '<div class="grow center"><div class="paused">Paused</div><button class="btn primary" data-act="resume" style="align-self:center">Resume the clock</button></div>'
+      : (S.card ? G.card(S.card) : '<div class="grow center"><div class="big">That is the whole deck!</div></div>');
+    return '<div class="play">' + clock(t) + ruleStrip() + mid +
+      '<div class="play-meta"><span>' + G.plural(t.won.length, 'card') + ' · ' + G.plural(pts, 'point') + '</span>' +
+      (t.won.length && !t.paused ? '<button class="btn ghost small" data-act="undo">Undo last</button>' : '<span>' + G.plural(S.pileCount, 'card') + ' left</span>') + '</div>' +
+      '<div class="play-btns"><button class="btn" data-act="skip"' + (t.paused ? ' disabled' : '') + '>Skip</button><button class="btn go" data-act="got"' + (t.paused ? ' disabled' : '') + '>Got it!</button></div></div>';
+  }
+  function watchView(me, t) {
+    var onTeam = me.team === t.team, team = S.teams.filter(function (x) { return x.id === t.team; })[0];
+    return '<div class="play">' + (S.you.captain ? clock(t) : clock(t).replace(/<button[^]*?<\/button>/, '')) + ruleStrip() +
+      '<div class="grow center">' + (t.paused ? '<div class="paused">Paused</div>' : '') +
+      '<span class="team-tag" style="' + G.teamStyle(t.team) + ';align-self:center">' + esc(team ? team.name : '') + '</span>' +
+      '<div class="big">' + (onTeam ? 'Guess out loud!' : esc(t.giverName) + ' is giving clues') + '</div>' +
+      '<p class="sub">' + (onTeam ? esc(t.giverName) + ' is giving the clues.' : 'Listen for slip-ups. If they break a rule, they have to skip the card.') + '</p>' +
+      '<div class="tally">' + t.won.map(G.chip).join('') + '</div></div></div>';
+  }
+  function scoreRows(winners) {
+    return '<div class="scores">' + S.teams.slice().sort(function (a, b) { return b.score - a.score; }).map(function (t) {
+      return '<div class="score-row' + (winners && winners.indexOf(t.id) >= 0 ? ' win' : '') + '" style="' + G.teamStyle(t.id) + '"><span>' + esc(t.name) + '</span><span class="n">' + t.score + '</span></div>';
+    }).join('') + '</div>';
+  }
+  function recapView(me, t) {
+    var L = S.last || { won: [], giverName: '' };
+    return '<div class="grow center"><div class="eyebrow">Time!</div><div class="big">' + esc(L.giverName) + ' got ' + G.plural(L.won.length, 'card') + '</div>' +
+      '<div class="tally">' + L.won.map(G.chip).join('') + '</div>' + scoreRows() +
+      '<p class="sub">Up next: <b>' + esc(t.giverName) + '</b></p></div>' + hostRow('<button class="btn small" data-act="next">Next turn</button>');
+  }
+  function roundEndView() {
+    var more = S.round < S.rounds;
+    return '<div class="grow center"><div class="eyebrow">The deck is empty</div><div class="big">Round ' + S.round + ' is done</div>' + scoreRows() +
+      (more ? '<p class="sub">Next: Round ' + (S.round + 1) + ', ' + esc(R.ROUNDS[S.round].name) + '. Same cards, tougher rules.</p>' : '') + '</div>' +
+      (S.you.captain ? '<button class="btn primary wide" data-act="next">Start round ' + (S.round + 1) + '</button>' : '<p class="sub center">The host starts the next round.</p>');
+  }
+  function overView(me) {
+    var won = S.winners.indexOf(me.team) >= 0, names = S.teams.filter(function (t) { return S.winners.indexOf(t.id) >= 0; }).map(function (t) { return t.name; });
+    return '<div class="grow center"><div class="eyebrow">' + (S.winners.length > 1 ? 'It is a tie' : 'Winner') + '</div><div class="big">' + esc(names.join(' & ')) + '</div>' +
+      '<p class="sub">' + (won ? 'That is you. Take a bow.' : 'So close. Demand a rematch.') + '</p>' + scoreRows(S.winners) +
+      '<div class="stack">' + (S.awards || []).map(function (a) { return '<div class="award"><b>' + esc(a.title) + '</b><span>' + esc(a.who) + '</span><small>' + esc(a.detail) + '</small></div>'; }).join('') + '</div></div>' +
+      (S.you.captain ? '<button class="btn primary wide" data-act="again">Play again</button>' : '');
+  }
+
+  /* -------------------------------------------------------------- clock */
+  function tick() {
+    var num = $('#clockNum'); if (!num || !S || !S.turn) return;
+    var left = G.msLeft(S.turn), total = S.timerSec * 1000, sec = Math.ceil(left / 1000);
+    num.textContent = sec;
+    $('#clockBar').style.transform = 'scaleX(' + Math.max(0, Math.min(1, left / total)) + ')';
+    var low = sec <= 10 && !S.turn.paused;
+    $('#clock').classList.toggle('low', low);
+    if (low && !lowBuzzed && S.turn.giver === S.you.id) { lowBuzzed = true; G.buzz(60); }
+  }
+  setInterval(tick, 100);
+
+  /* ------------------------------------------------------------- actions */
+  function sheet(html) {
+    var wrap = document.createElement('div'); wrap.className = 'sheet-wrap'; wrap.innerHTML = '<div class="sheet">' + html + '</div>';
+    wrap.addEventListener('click', function (e) { if (e.target === wrap || (e.target.getAttribute && e.target.getAttribute('data-x') === 'close')) wrap.remove(); });
+    document.body.appendChild(wrap); return wrap;
+  }
+  function helpSheet() {
+    sheet('<div class="help"><h3 style="margin-top:0">How to play</h3><p>Two or more teams. One deck of names. On your turn, get your team to say as many names as you can before the clock runs out.</p>' +
+      R.ROUNDS.slice(0, S && S.settings ? S.settings.rounds : 3).map(function (r) { return '<h3>Round ' + r.n + ': ' + esc(r.name) + '</h3><ul>' + r.rules.map(function (x) { return '<li>' + esc(x) + '</li>'; }).join('') + '</ul>'; }).join('') +
+      '<h3>Good to know</h3><ul><li>The same cards come back every round, so pay attention to the other team too.</li><li>Broke a rule? Skip that card.</li><li>Skipped cards go to the bottom of the deck.</li><li>Dots on a card are its points. Harder names are worth more.</li></ul></div>' +
+      '<div class="sheet-btns"><button class="btn primary" data-x="close">Got it</button></div>');
+  }
+  function menuSheet() {
+    var me = S.you, h = '<h3>' + esc(me.name) + '</h3><p>Game ' + esc(S.code) + ' · version ' + G.VERSION + '</p><div class="stack" style="margin-top:1em">';
+    if (me.captain && S.phase !== 'lobby') h += '<button class="btn" data-m="end">End this game for everyone</button>';
+    if (S.phase === 'lobby') h += '<button class="btn" data-m="leave">Leave the game</button>';
+    h += '<button class="btn ghost" data-x="close">Close</button></div>';
+    var w = sheet(h);
+    w.addEventListener('click', function (e) {
+      var m = e.target.getAttribute && e.target.getAttribute('data-m'); if (!m) return;
+      w.remove();
+      if (m === 'leave') act({ t: 'leave' });
+      if (m === 'end') G.ask('End this game?', 'Everyone goes back to the lobby and the scores are cleared.', 'End the game', function () { act({ t: 'end' }); });
+    });
+  }
+  function renameSheet() {
+    var team = S.teams.filter(function (t) { return t.id === S.you.team; })[0];
+    var w = sheet('<h3>Name your team</h3><form id="rn"><label class="field">Team name<input id="rnIn" maxlength="18" value="' + esc(team.name) + '"></label>' +
+      '<div class="sheet-btns"><button class="btn ghost" type="button" data-x="close">Cancel</button><button class="btn primary" type="submit">Save</button></div></form>');
+    var input = $('#rnIn', w); input.focus(); input.select();
+    $('#rn', w).addEventListener('submit', function (e) { e.preventDefault(); act({ t: 'rename', team: team.id, name: input.value }); w.remove(); });
+  }
+  app.addEventListener('submit', function (e) {
+    e.preventDefault();
+    var code = $('#code').value.toUpperCase().replace(/[^A-Z]/g, ''), name = $('#name').value.trim();
+    if (code.length !== 4) { joinErr = 'The code is the four letters on the TV.'; return draw(); }
+    if (!name) { joinErr = 'Type a name first.'; return draw(); }
+    urlCode = code; G.store.set('hn.name', name); joinErr = '';
+    act({ t: 'join', code: code, name: name });
+  });
+  app.addEventListener('click', function (e) {
+    var b = e.target.closest('[data-act]'); if (!b) return;
+    var a = b.getAttribute('data-act');
+    if (a === 'help') return helpSheet();
+    if (a === 'menu') return menuSheet();
+    if (a === 'rename') return renameSheet();
+    if (a === 'forget') { seat = null; waiting = false; G.store.del('hn.seat'); return draw(); }
+    if (a === 'team') return act({ t: 'team', team: Number(b.getAttribute('data-team')) });
+    if (a === 'set') {
+      var key = b.getAttribute('data-key'), list = R.CHOICES[key];
+      return act({ t: 'set', key: key, value: list[(list.indexOf(S.settings[key]) + 1) % list.length] });
+    }
+    if (a === 'got') G.sound.got();
+    act({ t: a });
+  });
+  draw();
+})();
+</script>
+</body>
+</html>
