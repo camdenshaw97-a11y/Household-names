@@ -38,7 +38,9 @@
       waiting = false; rejoinTries = 0; joinErr = '';
       return;
     }
-    if (m.t === 'state') { S = m; G.sync(m); return draw(); }
+    if (m.t === 'state') { S = m; G.sync(m); draw(); return refreshAdmin(); }
+    if (m.t === 'adminOk') { if (S && S.you) S.you.admin = true; closeSheets(); return adminPanel(); }
+    if (m.t === 'adminNo') { var pe = document.getElementById('pinErr'); if (pe) { pe.textContent = m.msg; var pi = document.getElementById('pinIn'); if (pi) { pi.value = ''; pi.focus(); } } else G.toast(m.msg); return; }
     if (m.t === 'nope') {
       if (m.why === 'noroom' && seat && rejoinTries < 25) {            // the server may have just restarted: the TV hands the game back
         rejoinTries++; waiting = true; draw();
@@ -51,7 +53,8 @@
     }
     if (m.t === 'left' || m.t === 'bumped') {
       seat = null; S = null; waiting = false; G.store.del('hn.seat');
-      joinErr = m.t === 'bumped' ? 'This seat was opened on another phone.' : '';
+      joinErr = m.t === 'bumped' ? 'This seat was opened on another phone.' : m.why === 'kicked' ? 'You were removed from the game.' : '';
+      closeSheets();
       return draw();
     }
     if (m.t === 'fx') return fx(m);
@@ -124,8 +127,8 @@
   function lobbyView(me) {
     var h = '<div class="stack">' + S.teams.map(function (t) { return teamBlock(t, me, true); }).join('') + '</div>' +
       '<div class="host-row"><button class="btn ghost small" data-act="rename">Rename my team</button></div>';
-    if (me.captain) {
-      h += '<div class="panel stack"><div class="eyebrow">You are the host ★</div><div class="settings">' +
+    if (me.captain || me.admin) {
+      h += '<div class="panel stack"><div class="eyebrow">' + (me.captain ? 'You are the host ★' : 'Admin') + '</div><div class="settings">' +
         settingBtn('rating', true) + settingBtn('teams') + settingBtn('cards') + settingBtn('timer') + settingBtn('rounds') + '</div>' +
         '<button class="btn ghost small" data-act="shuffle">Shuffle the teams</button>' +
         '<div class="err">' + esc(S.startError) + '</div>' +
@@ -137,7 +140,8 @@
     return h;
   }
   function ruleStrip() { var r = R.ROUNDS[S.round - 1]; return '<div class="rule-strip"><b>Round ' + S.round + '</b>' + esc(r.name) + ': ' + esc(r.short) + '</div>'; }
-  function hostRow(btns) { return S.you.captain ? '<div class="host-row">' + btns + '</div>' : ''; }
+  function boss() { return !!(S.you && (S.you.captain || S.you.admin)); }
+  function hostRow(btns) { return boss() ? '<div class="host-row">' + btns + '</div>' : ''; }
   function introView() {
     return '<div class="grow">' + G.roundCard(S.round, S.rounds) + '</div>' + hostRow('<button class="btn small" data-act="next">Skip ahead</button>');
   }
@@ -168,7 +172,7 @@
   }
   function watchView(me, t) {
     var onTeam = me.team === t.team, team = S.teams.filter(function (x) { return x.id === t.team; })[0];
-    return '<div class="play">' + (S.you.captain ? clock(t) : clock(t).replace(/<button[^]*?<\/button>/, '')) + ruleStrip() +
+    return '<div class="play">' + (boss() ? clock(t) : clock(t).replace(/<button[^]*?<\/button>/, '')) + ruleStrip() +
       '<div class="grow center">' + (t.paused ? '<div class="paused">Paused</div>' : '') +
       '<span class="team-tag" style="' + G.teamStyle(t.team) + ';align-self:center">' + esc(team ? team.name : '') + '</span>' +
       '<div class="big">' + (onTeam ? 'Guess out loud!' : esc(t.giverName) + ' is giving clues') + '</div>' +
@@ -190,14 +194,14 @@
     var more = S.round < S.rounds;
     return '<div class="grow center"><div class="eyebrow">The deck is empty</div><div class="big">Round ' + S.round + ' is done</div>' + scoreRows() +
       (more ? '<p class="sub">Next: Round ' + (S.round + 1) + ', ' + esc(R.ROUNDS[S.round].name) + '. Same cards, tougher rules.</p>' : '') + '</div>' +
-      (S.you.captain ? '<button class="btn primary wide" data-act="next">Start round ' + (S.round + 1) + '</button>' : '<p class="sub center">The host starts the next round.</p>');
+      (boss() ? '<button class="btn primary wide" data-act="next">Start round ' + (S.round + 1) + '</button>' : '<p class="sub center">The host starts the next round.</p>');
   }
   function overView(me) {
     var won = S.winners.indexOf(me.team) >= 0, names = S.teams.filter(function (t) { return S.winners.indexOf(t.id) >= 0; }).map(function (t) { return t.name; });
     return '<div class="grow center"><div class="eyebrow">' + (S.winners.length > 1 ? 'It is a tie' : 'Winner') + '</div><div class="big">' + esc(names.join(' & ')) + '</div>' +
       '<p class="sub">' + (won ? 'That is you. Take a bow.' : 'So close. Demand a rematch.') + '</p>' + scoreRows(S.winners) +
       '<div class="stack">' + (S.awards || []).map(function (a) { return '<div class="award"><b>' + esc(a.title) + '</b><span>' + esc(a.who) + '</span><small>' + esc(a.detail) + '</small></div>'; }).join('') + '</div></div>' +
-      (S.you.captain ? '<button class="btn primary wide" data-act="again">Play again</button>' : '');
+      (boss() ? '<button class="btn primary wide" data-act="again">Play again</button>' : '');
   }
 
   /* -------------------------------------------------------------- clock */
@@ -213,36 +217,166 @@
   setInterval(tick, 100);
 
   /* ------------------------------------------------------------- actions */
-  function sheet(html) {
-    var wrap = document.createElement('div'); wrap.className = 'sheet-wrap'; wrap.innerHTML = '<div class="sheet">' + html + '</div>';
-    wrap.addEventListener('click', function (e) { if (e.target === wrap || (e.target.getAttribute && e.target.getAttribute('data-x') === 'close')) wrap.remove(); });
-    document.body.appendChild(wrap); return wrap;
+  // A pop-up. Its body scrolls on its own; the X in the top corner and the backdrop always close it.
+  function sheet(html, title, cls) {
+    var wrap = document.createElement('div'); wrap.className = 'sheet-wrap';
+    wrap.innerHTML = '<div class="sheet ' + (cls || '') + '" role="dialog" aria-modal="true">' +
+      '<div class="sheet-head"><h3>' + esc(title || '') + '</h3><button class="sheet-x" data-x="close" aria-label="Close">✕</button></div>' +
+      '<div class="sheet-body">' + html + '</div></div>';
+    wrap.addEventListener('click', function (e) {
+      if (e.target === wrap || e.target.closest('[data-x="close"]')) closeSheet(wrap);
+    });
+    // Stop a swipe on the backdrop from scrolling the page underneath.
+    wrap.addEventListener('touchmove', function (e) { if (!e.target.closest('.sheet-body')) e.preventDefault(); }, { passive: false });
+    document.body.appendChild(wrap); document.documentElement.classList.add('locked');
+    return wrap;
   }
+  function closeSheet(w) {
+    if (w === adminWrap) adminWrap = null;
+    w.remove();
+    if (!document.querySelector('.sheet-wrap')) document.documentElement.classList.remove('locked');
+  }
+  function closeSheets() { document.querySelectorAll('.sheet-wrap').forEach(closeSheet); }
+  document.addEventListener('keydown', function (e) { if (e.key === 'Escape') { var all = document.querySelectorAll('.sheet-wrap'); if (all.length) closeSheet(all[all.length - 1]); } });
+
   function helpSheet() {
-    sheet('<div class="help"><h3 style="margin-top:0">How to play</h3><p>Two or more teams. One deck of names. On your turn, get your team to say as many names as you can before the clock runs out.</p>' +
+    sheet('<div class="help"><p>Two or more teams. One deck of names. On your turn, get your team to say as many names as you can before the clock runs out.</p>' +
       R.ROUNDS.slice(0, S && S.settings ? S.settings.rounds : 3).map(function (r) { return '<h3>Round ' + r.n + ': ' + esc(r.name) + '</h3><ul>' + r.rules.map(function (x) { return '<li>' + esc(x) + '</li>'; }).join('') + '</ul>'; }).join('') +
       '<h3>Good to know</h3><ul><li>The same cards come back every round, so pay attention to the other team too.</li><li>Broke a rule? Skip that card.</li><li>Skipped cards go to the bottom of the deck.</li><li>Dots on a card are its points. Harder names are worth more.</li></ul></div>' +
-      '<div class="sheet-btns"><button class="btn primary" data-x="close">Got it</button></div>');
+      '<div class="sheet-btns"><button class="btn primary" data-x="close">Got it</button></div>', 'How to play');
   }
   function menuSheet() {
-    var me = S.you, h = '<h3>' + esc(me.name) + '</h3><p>Game ' + esc(S.code) + ' · version ' + G.VERSION + '</p><div class="stack" style="margin-top:1em">';
-    if (me.captain && S.phase !== 'lobby') h += '<button class="btn" data-m="end">End this game for everyone</button>';
+    var me = S.you, h = '<p>Game ' + esc(S.code) + ' · version ' + G.VERSION + '</p><div class="stack" style="margin-top:1em">';
+    if (boss() && S.phase !== 'lobby') h += '<button class="btn" data-m="end">End this game for everyone</button>';
     if (S.phase === 'lobby') h += '<button class="btn" data-m="leave">Leave the game</button>';
+    h += '<button class="btn" data-m="admin">' + (me.admin ? 'Admin controls' : '🔒 Admin controls') + '</button>';
     h += '<button class="btn ghost" data-x="close">Close</button></div>';
-    var w = sheet(h);
+    var w = sheet(h, me.name);
     w.addEventListener('click', function (e) {
-      var m = e.target.getAttribute && e.target.getAttribute('data-m'); if (!m) return;
-      w.remove();
+      var b = e.target.closest('[data-m]'); if (!b) return;
+      var m = b.getAttribute('data-m');
+      closeSheet(w);
       if (m === 'leave') act({ t: 'leave' });
       if (m === 'end') G.ask('End this game?', 'Everyone goes back to the lobby and the scores are cleared.', 'End the game', function () { act({ t: 'end' }); });
+      if (m === 'admin') { if (S.you.admin) adminPanel(); else pinSheet(); }
     });
+  }
+
+  /* --------------------------------------------------- admin controls */
+  function pinSheet() {
+    var w = sheet('<p>Enter the admin PIN.</p><form id="pinForm" autocomplete="off">' +
+      '<input id="pinIn" class="pin" type="password" inputmode="numeric" pattern="[0-9]*" maxlength="8" autocomplete="off" aria-label="Admin PIN">' +
+      '<div class="err" id="pinErr"></div>' +
+      '<div class="sheet-btns"><button class="btn ghost" type="button" data-x="close">Cancel</button><button class="btn primary" type="submit">Unlock</button></div></form>', 'Admin controls');
+    var input = $('#pinIn', w); setTimeout(function () { input.focus(); }, 50);
+    $('#pinForm', w).addEventListener('submit', function (e) {
+      e.preventDefault();
+      var pin = input.value.replace(/\D/g, '');
+      if (!pin) return;
+      $('#pinErr', w).textContent = '';
+      act({ t: 'adminPin', pin: pin });
+    });
+  }
+
+  var adminWrap = null;
+  function adminPanel() {
+    if (adminWrap) closeSheet(adminWrap);
+    adminWrap = sheet('', 'Admin controls', 'admin');
+    adminWrap.addEventListener('click', adminClick);
+    refreshAdmin();
+  }
+  function refreshAdmin() {
+    if (!adminWrap) return;
+    if (!S || !S.you || !S.you.admin) { closeSheet(adminWrap); return; }
+    var body = $('.sheet-body', adminWrap), top = body.scrollTop;
+    body.innerHTML = adminHtml();
+    body.scrollTop = top;
+  }
+  function shortTeam(n) { n = String(n).replace(/^team\s+/i, ''); return n.length > 9 ? n.slice(0, 8) + '…' : n; }
+  function aBtn(label, cmd, extra, cls) {
+    return '<button class="btn small ' + (cls || '') + '" data-a="' + cmd + '"' + (extra || '') + '>' + label + '</button>';
+  }
+  function adminHtml() {
+    var h = '', ph = S.phase, between = ph === 'ready' || ph === 'intro' || ph === 'recap';
+    if (ph !== 'lobby') {
+      h += '<div class="a-sec"><div class="eyebrow">Game · round ' + S.round + ' of ' + S.rounds + '</div><div class="a-grid">';
+      if (ph === 'turn') {
+        h += aBtn(S.turn.paused ? 'Resume the clock' : 'Pause the clock', S.turn.paused ? 'resume' : 'pause');
+        h += aBtn('End this turn now', 'a_endTurn');
+      }
+      if (ph === 'ready') h += aBtn('Start ' + esc(S.turn.giverName) + '’s turn', 'go');
+      if (between) {
+        h += aBtn('Next clue-giver on this team', 'a_pass');
+        h += aBtn('Skip to the next team', 'a_skipTeam');
+      }
+      if (ph === 'intro' || ph === 'recap' || ph === 'roundEnd') h += aBtn(ph === 'roundEnd' ? 'Start the next round' : 'Move on', 'next');
+      if (ph === 'turn' || between) h += aBtn('End this round now', 'a_endRound', ' data-confirm="1"');
+      if (ph === 'over') h += aBtn('Back to the lobby', 'again');
+      h += aBtn('End the game for everyone', 'end', ' data-confirm="1"', 'danger');
+      h += '</div></div>';
+      h += '<div class="a-sec"><div class="eyebrow">Scores</div>' + S.teams.map(function (t) {
+        return '<div class="a-score" style="' + G.teamStyle(t.id) + '"><span class="a-tname">' + esc(t.name) + '</span>' +
+          aBtn('−1', 'a_score', ' data-team="' + t.id + '" data-delta="-1"') + '<b>' + t.score + '</b>' + aBtn('+1', 'a_score', ' data-team="' + t.id + '" data-delta="1"') + '</div>';
+      }).join('') + '</div>';
+    }
+    h += '<div class="a-sec"><div class="eyebrow">Players · ' + S.count + '</div>' + S.teams.map(function (t) {
+      return '<div class="a-team" style="' + G.teamStyle(t.id) + '"><div class="a-tname">' + esc(t.name) + '</div>' + (t.players.map(function (p) {
+        var moves = S.teams.filter(function (o) { return o.id !== t.id; }).map(function (o) {
+          return '<button class="a-dot" style="' + G.teamStyle(o.id) + '" data-a="a_move" data-id="' + p.id + '" data-team="' + o.id + '" aria-label="Move to ' + esc(o.name) + '">→ ' + esc(shortTeam(o.name)) + '</button>';
+        }).join('');
+        var tags = (p.id === S.captainId ? ' ★' : '') + (p.id === S.you.id ? ' (you)' : '') + (p.on ? '' : ' · away') + (S.turn && S.turn.giver === p.id && ph !== 'lobby' ? ' · up now' : '');
+        return '<div class="a-player"><div class="a-pname' + (p.on ? '' : ' off') + '">' + esc(p.name) + '<small>' + esc(tags) + '</small></div><div class="a-acts">' + moves +
+          (p.id === S.captainId ? '' : aBtn('Host', 'a_host', ' data-id="' + p.id + '"')) +
+          aBtn('Rename', 'a_rename', ' data-id="' + p.id + '" data-name="' + esc(p.name) + '"') +
+          (p.id === S.you.id ? '' : aBtn('Kick', 'a_kick', ' data-id="' + p.id + '" data-name="' + esc(p.name) + '"', 'danger')) + '</div></div>';
+      }).join('') || '<div class="empty">Nobody</div>') + '</div>';
+    }).join('') + '</div>';
+    if (S.blocked && S.blocked.length) {
+      h += '<div class="a-sec"><div class="eyebrow">Blocked from this game</div>' + S.blocked.map(function (n) {
+        return '<div class="a-player"><div class="a-pname">' + esc(n) + '</div><div class="a-acts">' + aBtn('Unblock', 'a_unblock', ' data-name="' + esc(n) + '"') + '</div></div>';
+      }).join('') + '</div>';
+    }
+    h += '<div class="a-sec"><button class="btn ghost wide" data-a="lock">Lock admin controls</button></div>';
+    return h;
+  }
+  function adminClick(e) {
+    var b = e.target.closest('[data-a]'); if (!b) return;
+    var a = b.getAttribute('data-a'), id = b.getAttribute('data-id'), name = b.getAttribute('data-name');
+    if (a === 'lock') { act({ t: 'adminOff' }); return closeSheet(adminWrap); }
+    if (a === 'a_kick') return kickSheet(id, name);
+    if (a === 'a_rename') return renamePlayerSheet(id, name);
+    if (a === 'a_move') return act({ t: a, id: id, team: Number(b.getAttribute('data-team')) });
+    if (a === 'a_score') return act({ t: a, team: Number(b.getAttribute('data-team')), delta: Number(b.getAttribute('data-delta')) });
+    if (a === 'a_unblock') return act({ t: a, name: name });
+    if (b.getAttribute('data-confirm')) {
+      var q = a === 'end' ? ['End this game?', 'Everyone goes back to the lobby and the scores are cleared.', 'End the game']
+        : ['End this round now?', 'The cards nobody has guessed yet are left over. Scores so far stay.', 'End the round'];
+      return G.ask(q[0], q[1], q[2], function () { act({ t: a }); });
+    }
+    act({ t: a, id: id });
+  }
+  function kickSheet(id, name) {
+    var w = sheet('<p>Take ' + esc(name) + ' out of this game. If it is their turn, the turn ends.</p><div class="stack" style="margin-top:1em">' +
+      '<button class="btn danger" data-k="kick">Kick ' + esc(name) + '</button>' +
+      '<button class="btn" data-k="block">Kick and don’t let them back in</button>' +
+      '<button class="btn ghost" data-x="close">Cancel</button></div>', 'Kick ' + name + '?');
+    w.addEventListener('click', function (e) {
+      var b = e.target.closest('[data-k]'); if (!b) return;
+      act({ t: 'a_kick', id: id, block: b.getAttribute('data-k') === 'block' }); closeSheet(w);
+    });
+  }
+  function renamePlayerSheet(id, name) {
+    var w = sheet('<form id="prn"><label class="field">Name<input id="prnIn" maxlength="14" value="' + esc(name) + '"></label>' +
+      '<div class="sheet-btns"><button class="btn ghost" type="button" data-x="close">Cancel</button><button class="btn primary" type="submit">Save</button></div></form>', 'Rename ' + name);
+    var input = $('#prnIn', w); input.focus(); input.select();
+    $('#prn', w).addEventListener('submit', function (e) { e.preventDefault(); act({ t: 'a_rename', id: id, name: input.value }); closeSheet(w); });
   }
   function renameSheet() {
     var team = S.teams.filter(function (t) { return t.id === S.you.team; })[0];
-    var w = sheet('<h3>Name your team</h3><form id="rn"><label class="field">Team name<input id="rnIn" maxlength="18" value="' + esc(team.name) + '"></label>' +
-      '<div class="sheet-btns"><button class="btn ghost" type="button" data-x="close">Cancel</button><button class="btn primary" type="submit">Save</button></div></form>');
+    var w = sheet('<form id="rn"><label class="field">Team name<input id="rnIn" maxlength="18" value="' + esc(team.name) + '"></label>' +
+      '<div class="sheet-btns"><button class="btn ghost" type="button" data-x="close">Cancel</button><button class="btn primary" type="submit">Save</button></div></form>', 'Name your team');
     var input = $('#rnIn', w); input.focus(); input.select();
-    $('#rn', w).addEventListener('submit', function (e) { e.preventDefault(); act({ t: 'rename', team: team.id, name: input.value }); w.remove(); });
+    $('#rn', w).addEventListener('submit', function (e) { e.preventDefault(); act({ t: 'rename', team: team.id, name: input.value }); closeSheet(w); });
   }
   app.addEventListener('submit', function (e) {
     e.preventDefault();

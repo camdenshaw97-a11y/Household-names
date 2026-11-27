@@ -61,6 +61,16 @@ const BACKUP_KEY = (() => {
 
 const rooms = new Map();
 
+// Admin controls on a phone are unlocked with a PIN. It is set on the server (Render: Environment,
+// ADMIN_PIN) and never written into the code. With no ADMIN_PIN set, the admin panel stays locked.
+const ADMIN_PIN_HASH = process.env.ADMIN_PIN ? crypto.createHash('sha256').update(String(process.env.ADMIN_PIN).trim()).digest() : null;
+const PIN_TRIES = 5, PIN_LOCK_MS = 60 * 1000, ROOM_PIN_TRIES = 20, ROOM_PIN_LOCK_MS = 10 * 60 * 1000;
+function pinMatches(pin) {
+  if (!ADMIN_PIN_HASH) return false;
+  const h = crypto.createHash('sha256').update(String(pin == null ? '' : pin).trim()).digest();
+  return crypto.timingSafeEqual(h, ADMIN_PIN_HASH);
+}
+
 /* ------------------------------------------------------------------ http */
 
 const server = http.createServer((req, res) => {
@@ -119,7 +129,7 @@ function newRoom() {
     code: makeCode(), adminToken: rid(18), touched: Date.now(),
     settings: Object.assign({}, Rules.DEFAULTS),
     teams: Rules.TEAMS.map(t => ({ id: t.id, name: t.name })),
-    players: new Map(), captainId: null, game: null, used: [],
+    players: new Map(), captainId: null, game: null, used: [], blocked: [], pinFails: [],
     tvs: new Set(), timer: null, backupTimer: null
   };
   rooms.set(room.code, room);
@@ -344,7 +354,8 @@ function pushState(room) {
   for (const ws of room.tvs) if (ws.readyState === 1) ws.send(tvMsg);
   for (const p of room.players.values()) {
     if (!p.ws || p.ws.readyState !== 1) continue;
-    const mine = Object.assign({}, s, { you: { id: p.id, name: p.name, team: p.team, captain: p.id === room.captainId } });
+    const mine = Object.assign({}, s, { you: { id: p.id, name: p.name, team: p.team, captain: p.id === room.captainId, admin: !!p.admin } });
+    if (p.admin) { mine.blocked = room.blocked; mine.adminReady = true; }
     // The card in play goes to the clue-giver's phone and nowhere else.
     if (g && g.phase === 'turn' && g.turn.giver === p.id && g.pile.length) mine.card = cardOut(g.pile[0]);
     p.ws.send(JSON.stringify(mine));
@@ -367,8 +378,8 @@ function packRoom(room) {
     if (g.phase === 'turn' && !g.turn.paused) { game.turn.paused = true; game.turn.remaining = Math.max(1000, (g.turn.endsAt - Date.now()) * SPEED); }
   }
   const data = {
-    v: 1, code: room.code, adminToken: room.adminToken, settings: room.settings, teams: room.teams, captainId: room.captainId, used: room.used, game,
-    players: [...room.players.values()].map(p => ({ id: p.id, token: p.token, name: p.name, team: p.team, joinedAt: p.joinedAt, stats: p.stats || null }))
+    v: 1, code: room.code, adminToken: room.adminToken, settings: room.settings, teams: room.teams, captainId: room.captainId, used: room.used, blocked: room.blocked, game,
+    players: [...room.players.values()].map(p => ({ id: p.id, token: p.token, name: p.name, team: p.team, joinedAt: p.joinedAt, stats: p.stats || null, admin: !!p.admin }))
   };
   const plain = zlib.deflateRawSync(Buffer.from(JSON.stringify(data)));
   const iv = crypto.randomBytes(12), c = crypto.createCipheriv('aes-256-gcm', BACKUP_KEY, iv);
@@ -394,7 +405,7 @@ function restoreRoom(blob, code, token) {
   const room = {
     code, adminToken: token, touched: Date.now(), settings: Object.assign({}, Rules.DEFAULTS, data.settings),
     teams: data.teams, players: new Map(), captainId: data.captainId, game: data.game, used: data.used || [],
-    tvs: new Set(), timer: null, backupTimer: null
+    blocked: data.blocked || [], pinFails: [], tvs: new Set(), timer: null, backupTimer: null
   };
   for (const p of data.players) room.players.set(p.id, Object.assign({ ws: null, connected: false }, p));
   rooms.set(code, room);
@@ -463,6 +474,7 @@ function handle(ws, m) {
     }
     const name = clean(m.name, 14);
     if (!name) return send(ws, { t: 'nope', why: 'name', msg: 'Type a name first.' });
+    if (room.blocked.includes(name.toLowerCase())) return send(ws, { t: 'nope', why: 'blocked', msg: 'You can’t join this game.' });
     const same = [...room.players.values()].find(p => p.name.toLowerCase() === name.toLowerCase());
     if (same) {
       if (same.connected) return send(ws, { t: 'nope', why: 'taken', msg: 'Someone is already playing as ' + same.name + '.' });
@@ -479,8 +491,28 @@ function handle(ws, m) {
   if (!room) return;
   const me = ws.tv ? null : room.players.get(ws.pid);
   if (!ws.tv && !me) return;
-  const boss = ws.tv || (me && me.id === room.captainId);
+  const admin = ws.tv || !!(me && me.admin);
+  const boss = admin || (me && me.id === room.captainId);
   const g = room.game;
+
+  /* ---- unlocking admin controls with the PIN ---- */
+  if (m.t === 'adminPin' && me) {
+    const now = Date.now();
+    room.pinFails = room.pinFails.filter(t => now - t < ROOM_PIN_LOCK_MS);
+    if (!ADMIN_PIN_HASH) return send(ws, { t: 'adminNo', msg: 'Admin controls aren’t set up on this server yet.' });
+    if (me.pinLockUntil && now < me.pinLockUntil) return send(ws, { t: 'adminNo', msg: 'Too many wrong tries. Wait a minute.' });
+    if (room.pinFails.length >= ROOM_PIN_TRIES) return send(ws, { t: 'adminNo', msg: 'Too many wrong tries in this game. Wait ten minutes.' });
+    if (!pinMatches(m.pin)) {
+      room.pinFails.push(now); me.pinFails = (me.pinFails || 0) + 1;
+      if (me.pinFails >= PIN_TRIES) { me.pinFails = 0; me.pinLockUntil = now + PIN_LOCK_MS; }
+      return send(ws, { t: 'adminNo', msg: 'Wrong PIN.' });
+    }
+    me.admin = true; me.pinFails = 0;
+    changed(room);                         // the phone gets its admin state first, then the go-ahead
+    return send(ws, { t: 'adminOk' });
+  }
+  if (m.t === 'adminOff' && me) { me.admin = false; return changed(room); }
+  if (admin && m.t.startsWith('a_')) return adminAction(ws, room, me, m);
 
   /* ---- the lobby ---- */
   if (!g) {
@@ -515,7 +547,7 @@ function handle(ws, m) {
     }
     if (m.t === 'kick') {
       const p = room.players.get(String(m.id));
-      if (p) { send(p.ws, { t: 'left' }); room.players.delete(p.id); changed(room); }
+      if (p) { removePlayer(room, p, false); changed(room); }
       return;
     }
     if (m.t === 'start') {
@@ -548,6 +580,88 @@ function handle(ws, m) {
   }
   if (m.t === 'again' && g.phase === 'over') { clearTimer(room); room.game = null; return changed(room); }
   if (m.t === 'end') { clearTimer(room); room.game = null; fx(room, 'ended'); return changed(room); }
+}
+
+/* --------------------------------------------------------- admin controls */
+
+// Everything the admin panel on a phone can do. The TV may do these too.
+function adminAction(ws, room, me, m) {
+  const g = room.game, say = msg => send(ws, { t: 'nope', why: 'admin', msg });
+  const target = m.id != null ? room.players.get(String(m.id)) : null;
+  const between = g && (g.phase === 'ready' || g.phase === 'intro' || g.phase === 'recap');
+
+  if (m.t === 'a_kick') {
+    if (!target) return;
+    removePlayer(room, target, !!m.block);
+    fx(room, 'kicked');
+    return changed(room);
+  }
+  if (m.t === 'a_move') {
+    if (!target) return;
+    const team = Number(m.team);
+    if (!activeTeams(room).some(t => t.id === team) || target.team === team) return;
+    if (g && g.phase === 'turn' && g.turn.giver === target.id) return say('Wait until ' + target.name + '’s turn is over.');
+    target.team = team; target.joinedAt = Date.now();
+    if (between && g.turn.giver === target.id) setUpTurn(room);
+    return changed(room);
+  }
+  if (m.t === 'a_host') {
+    if (!target) return;
+    room.captainId = target.id;
+    return changed(room);
+  }
+  if (m.t === 'a_rename') {
+    if (!target) return;
+    const name = clean(m.name, 14);
+    if (!name) return;
+    if ([...room.players.values()].some(p => p !== target && p.name.toLowerCase() === name.toLowerCase())) return say('Someone is already called ' + name + '.');
+    target.name = name;
+    return changed(room);
+  }
+  if (m.t === 'a_unblock') {
+    const name = String(m.name || '').toLowerCase();
+    room.blocked = m.all ? [] : room.blocked.filter(n => n !== name);
+    return changed(room);
+  }
+  if (!g) return;
+  if (m.t === 'a_score') {
+    const team = Number(m.team), delta = Math.max(-5, Math.min(5, Math.trunc(Number(m.delta)) || 0));
+    if (!g.order.includes(team) || !delta) return;
+    g.scores[team] += delta; g.roundScores[g.round - 1][team] += delta;
+    if (g.phase === 'over') { const top = Math.max(...g.order.map(id => g.scores[id])); g.winners = g.order.filter(id => g.scores[id] === top); }
+    return changed(room);
+  }
+  if (m.t === 'a_endTurn') {
+    if (g.phase === 'turn') endTurn(room, 'time');
+    return;
+  }
+  if (m.t === 'a_pass' && between) {             // same team, next clue-giver
+    clearTimer(room); g.giverIdx[g.turn.team]++; setUpTurn(room); g.phase = 'ready';
+    return changed(room);
+  }
+  if (m.t === 'a_skipTeam' && between) {         // hand the turn to the next team
+    clearTimer(room); g.turnIdx++; setUpTurn(room); g.phase = 'ready';
+    return changed(room);
+  }
+  if (m.t === 'a_endRound' && (g.phase === 'turn' || between)) {
+    if (g.phase === 'turn') return endTurn(room, 'deck');
+    clearTimer(room);
+    if (!g.last) g.last = { team: g.turn.team, giver: g.turn.giver, giverName: '', won: [], skips: 0, reason: 'admin' };
+    g.phase = 'roundEnd';
+    fx(room, g.round >= g.rounds ? 'over' : 'roundEnd');
+    if (g.round >= g.rounds) finish(room);
+    return changed(room);
+  }
+}
+
+// Take a player out of the room, mid-game or not. A blocked name can't join this room again.
+function removePlayer(room, p, block) {
+  const g = room.game;
+  if (g && g.turn && g.turn.giver === p.id && g.phase === 'turn') endTurn(room, 'time');
+  room.players.delete(p.id);
+  if (g && g.turn && g.turn.giver === p.id && g.phase !== 'turn' && g.phase !== 'over' && g.phase !== 'roundEnd') setUpTurn(room);
+  if (block && !room.blocked.includes(p.name.toLowerCase())) room.blocked.push(p.name.toLowerCase());
+  if (p.ws) { send(p.ws, { t: 'left', why: 'kicked' }); p.ws.pid = null; p.ws.room = null; }
 }
 
 /* ------------------------------------------------------------ housekeeping */

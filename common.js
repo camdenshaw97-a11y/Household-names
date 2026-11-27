@@ -6,7 +6,7 @@
 
   G.TITLE = 'Household Names';
   // Goes up with every change; CHANGELOG.md says what each one was.
-  G.VERSION = '1.0.0';
+  G.VERSION = '1.1.0';
 
   G.$ = function (sel, root) { return (root || document).querySelector(sel); };
   G.esc = function (s) {

@@ -1,6 +1,7 @@
 'use strict';
 /* Household Names — plays whole games against the real server with pretend phones. Run with: npm test */
 process.env.SPEED_UP = '40';
+process.env.ADMIN_PIN = '424242';   // a stand-in PIN for the tests; the real one only lives on Render
 const WebSocket = require('ws');
 const { server, rooms, packRoom } = require('../server');
 const Deck = require('../deck');
@@ -230,6 +231,81 @@ async function until(fn, label, max = 4000) {
   ok(tvB.state.phase === 'over' && tvB.state.roundScores.length === 4, 'four-round game finishes');
   tvB.send({ t: 'end' }); await until(() => tvB.state.phase === 'lobby', 'end game returns to the lobby');
   P[1].send({ t: 'leave' }); await until(() => tvB.state.count === 5, 'a player can leave in the lobby');
+
+  /* ---- admin controls ---- */
+  const tvA = client(port); await tvA.open; tvA.send({ t: 'tv' }); await until(() => tvA.host && tvA.state, 'admin test room');
+  const codeA = tvA.host.code, A = [];
+  for (const n of ['Host', 'Boss', 'Gus', 'Hal', 'Ivy']) { const c = client(port); await c.open; c.send({ t: 'join', code: codeA, name: n }); await until(() => c.seat && c.state, n + ' joins'); A.push(c); }
+  const [hostA, bossA, gus, hal, ivy] = A;
+  bossA.send({ t: 'a_kick', id: gus.seat.id }); await sleep(60);
+  ok(tvA.state.count === 5, 'admin actions are refused before the PIN');
+  bossA.send({ t: 'adminPin', pin: '000000' }); await until(() => bossA.last('adminNo'), 'wrong pin answered');
+  ok(bossA.last('adminNo').msg === 'Wrong PIN.' && !bossA.state.you.admin, 'a wrong PIN is refused');
+  for (let i = 0; i < 4; i++) bossA.send({ t: 'adminPin', pin: '11111' + i });
+  await sleep(80); bossA.send({ t: 'adminPin', pin: '424242' });
+  await until(() => bossA.msgs.filter(m => m.t === 'adminNo').length === 6, 'lockout answered');
+  ok(/Too many/.test(bossA.last('adminNo').msg) && !bossA.state.you.admin, 'five wrong tries lock that phone out, even with the right PIN');
+  hostA.send({ t: 'adminPin', pin: ' 424242 ' }); await until(() => hostA.last('adminOk'), 'right pin');
+  await until(() => hostA.state.you.admin, 'admin flag');
+  ok(hostA.state.you.admin && !gus.state.you.admin && Array.isArray(hostA.state.blocked) && gus.state.blocked === undefined, 'only the admin phone is told it is admin');
+  ok(!JSON.stringify(hostA.msgs).includes('424242'), 'the PIN is never sent back to a phone');
+  hostA.send({ t: 'a_host', id: hal.seat.id }); await until(() => tvA.state.captainId === hal.seat.id, 'admin makes Hal the host');
+  ok(hostA.state.you.admin && !hostA.state.you.captain, 'admin keeps admin controls without being host');
+  hostA.send({ t: 'set', key: 'timer', value: 90 }); await until(() => tvA.state.settings.timer === 90, 'admin can change settings');
+  hostA.send({ t: 'a_rename', id: gus.seat.id, name: 'Gussy' }); await until(() => tvA.state.teams.some(t => t.players.some(p => p.name === 'Gussy')), 'admin renames a player');
+  hostA.send({ t: 'a_rename', id: ivy.seat.id, name: 'gussy' }); await until(() => hostA.last('nope') && hostA.last('nope').why === 'admin', 'duplicate rename refused');
+  // line the teams up: Host, Gus, Ivy on team 0; Boss, Hal on team 1
+  for (const [c, t] of [[hostA, 0], [gus, 0], [ivy, 0], [bossA, 1], [hal, 1]]) hostA.send({ t: 'a_move', id: c.seat.id, team: t });
+  await until(() => tvA.state.teams[0].players.length === 3 && tvA.state.teams[1].players.length === 2, 'admin moves players');
+  hostA.send({ t: 'start' }); await until(() => tvA.state.phase === 'intro', 'admin starts the game');
+  hostA.send({ t: 'next' }); await until(() => tvA.state.phase === 'ready', 'admin moves past the intro');
+  const firstTeam = tvA.state.turn.team, firstGiver = tvA.state.turn.giver;
+  hostA.send({ t: 'a_pass' }); await until(() => tvA.state.turn.giver !== firstGiver, 'next clue-giver');
+  ok(tvA.state.turn.team === firstTeam, 'pass keeps the same team');
+  hostA.send({ t: 'a_skipTeam' }); await until(() => tvA.state.turn.team !== firstTeam, 'skip to the next team');
+  const upNow = A.find(c => c.seat.id === tvA.state.turn.giver);
+  upNow.send({ t: 'go' }); await until(() => tvA.state.phase === 'turn', 'turn starts');
+  upNow.send({ t: 'got' }); await until(() => tvA.state.turn.won.length === 1, 'one card');
+  const teamUp = tvA.state.turn.team, before = tvA.state.teams.find(t => t.id === teamUp).score;
+  hostA.send({ t: 'a_score', team: teamUp, delta: 1 }); await until(() => tvA.state.teams.find(t => t.id === teamUp).score === before + 1, 'admin adds a point');
+  hostA.send({ t: 'a_score', team: teamUp, delta: -99 }); await until(() => tvA.state.teams.find(t => t.id === teamUp).score === before - 4, 'score change is capped at 5');
+  hostA.send({ t: 'a_score', team: teamUp, delta: 4 }); await until(() => tvA.state.teams.find(t => t.id === teamUp).score === before, 'score restored');
+  hostA.send({ t: 'a_move', id: upNow.seat.id, team: 1 - teamUp }); await until(() => hostA.msgs.filter(m => m.t === 'nope' && m.why === 'admin').length === 2, 'move refused mid-turn');
+  ok(tvA.state.turn.giver === upNow.seat.id, 'the clue-giver can’t be moved mid-turn');
+  // kick the clue-giver mid-turn, and block them
+  const kickedName = upNow.seat.name;
+  hostA.send({ t: 'a_kick', id: upNow.seat.id, block: true });
+  await until(() => upNow.last('left'), 'kicked phone told');
+  ok(upNow.last('left').why === 'kicked', 'the kicked phone is told it was removed');
+  await until(() => tvA.state.phase === 'recap' && tvA.state.count === 4, 'turn ends when the clue-giver is kicked');
+  ok(tvA.state.last.won.length === 1, 'the cards they won still count');
+  ok(hostA.state.blocked.includes(kickedName.toLowerCase()), 'admin sees the blocked name');
+  const back2 = client(port); await back2.open; back2.send({ t: 'join', code: codeA, name: kickedName });
+  await until(() => back2.last('nope'), 'blocked join answered'); ok(back2.last('nope').why === 'blocked', 'a blocked name can’t rejoin');
+  back2.send({ t: 'rejoin', code: codeA, id: upNow.seat.id, token: upNow.seat.token });
+  await until(() => back2.msgs.filter(m => m.t === 'nope').length === 2, 'old seat answered'); ok(back2.last('nope').why === 'noseat', 'the kicked seat is gone for good');
+  hostA.send({ t: 'a_unblock', name: kickedName }); await until(() => hostA.state.blocked.length === 0, 'unblock');
+  back2.send({ t: 'join', code: codeA, name: kickedName }); await until(() => back2.seat, 'unblocked player rejoins');
+  // kick the next clue-giver while they are waiting to start: the turn passes to a teammate
+  hostA.send({ t: 'next' }); await until(() => tvA.state.phase === 'ready', 'ready');
+  const waiting = tvA.state.turn.giver, wTeam = tvA.state.turn.team;
+  if (waiting !== hostA.seat.id) {
+    hostA.send({ t: 'a_kick', id: waiting }); await until(() => tvA.state.turn.giver !== waiting, 'waiting giver kicked');
+    ok(tvA.state.turn.team === wTeam && tvA.state.phase === 'ready', 'a teammate takes the waiting turn');
+  } else ok(true, 'skip: admin was up');
+  hostA.send({ t: 'a_endRound' }); await until(() => tvA.state.phase === 'roundEnd', 'admin ends the round');
+  hostA.send({ t: 'next' }); await until(() => tvA.state.round === 2, 'round two after an early end');
+  // the admin flag survives a server restart
+  await until(() => tvA.blob, 'backup'); await sleep(250);
+  const roomA = rooms.get(codeA); clearTimeout(roomA.timer); clearTimeout(roomA.backupTimer); rooms.delete(codeA);
+  const tvA2 = client(port); await tvA2.open; tvA2.send({ t: 'tv', code: codeA, token: tvA.host.token, blob: tvA.blob });
+  await until(() => tvA2.state, 'restored');
+  const hostBack = client(port); await hostBack.open; hostBack.send({ t: 'rejoin', code: codeA, id: hostA.seat.id, token: hostA.seat.token });
+  await until(() => hostBack.state, 'admin back'); ok(hostBack.state.you.admin, 'admin stays unlocked after a restart');
+  hostBack.send({ t: 'adminOff' }); await until(() => !hostBack.state.you.admin, 'lock admin');
+  hostBack.send({ t: 'a_endRound' }); await sleep(60); ok(tvA2.state.phase !== 'roundEnd', 'locked again: admin actions refused');
+  hostBack.send({ t: 'adminPin', pin: '424242' }); await until(() => hostBack.state.you.admin, 'unlock again');
+  hostBack.send({ t: 'end' }); await until(() => tvA2.state.phase === 'lobby', 'admin ends the game');
 
   console.log('\n' + pass + ' passed, ' + fail + ' failed');
   process.exit(fail ? 1 : 0);

@@ -17,6 +17,11 @@ card, with **Got it** and **Skip**. Everyone else shouts.
 - The first person in is the host and can change the settings and start the game from their phone.
   The TV can do the same (space bar = the main button on screen, M = sound on/off).
 
+## Admin controls
+The phone menu (≡) has an **Admin controls** button, unlocked with a PIN. Set the PIN on the server
+as the `ADMIN_PIN` environment variable (on Render: the service's Environment tab). It is never
+stored in the code, because this repo is public. With no `ADMIN_PIN` set, admin controls stay locked.
+
 ## Settings
 Deck (Family-friendly or After Dark, which is PG-13), 2–4 teams, 30–60 cards, 45–90 second turns,
 3 or 4 rounds.
